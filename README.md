@@ -142,6 +142,4 @@ Standard SHAP masks words in text but leaves the graph IDs untouched — so mask
 
 ## Authors
 Srivarshitha Medarametla . Vaishnavi Manda
-
-Srivarshitha Medarametla · Vaishnavi Manda · C. Swaroop  
 IIIT Hyderabad — Introduction to NLP, 2026
