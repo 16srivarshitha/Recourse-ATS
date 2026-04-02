@@ -248,12 +248,15 @@ The graph expert's std of 0.059 clears the healthy threshold of 0.05, confirming
 The gate allocates roughly 62% text / 38% graph on average — a significant improvement over v1, where the graph expert's gate weight was near-zero for many samples.
 
 ![**Plot 1: Expert score distributions**](../plots/expert_score_distribution_moev2.png)
+
 Overlapping histograms of text expert scores (blue) and graph expert scores (coral). The text expert shows a wider, higher-mean distribution; the graph expert shows a distinct, narrower distribution not concentrated at 0 or 1.
 
 ![**Plot 2: Gate weight distributions**](../plots/gate_weight_distributions_moev2.png)
+
  Histograms of text gate weights (blue) and graph gate weights (coral). The shape of these distributions shows how often the gate routes strongly toward one expert versus splitting evenly.
 
 ![**Plot 3: Skill count vs. graph gate weight**](../plots/skill_count_vs_graph_gate_weight.png)
+
  Scatter plot with normalised skill count on the x-axis and graph gate weight on the y-axis. An upward trend confirms the gate has learned that more skills = more graph evidence = higher graph weight.
 
 ---
