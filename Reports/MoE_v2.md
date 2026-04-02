@@ -7,6 +7,7 @@ This notebook is the **fourth stage** of the pipeline and a direct response to t
 Every change in v2 is motivated by a specific, diagnosed failure in v1. The goal was to come up with an architecture that is more honest and something that does what it claims to do.
 
 ---
+![Overall flow chart](../plots/moe_flowchart.png)
 
 ## What Changed from v1 and Why
 
