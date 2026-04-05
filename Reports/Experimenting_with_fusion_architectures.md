@@ -1,299 +1,174 @@
-# Notebook 3: Experimenting with Fusion Architectures for Resume-JD Fit Prediction
+# Experimenting with Fusion Architectures for Resume-JD Matching
 
-## Project Overview
+## What is this?
 
-This notebook is the **third stage** of a multi-notebook NLP pipeline that predicts how well a resume matches a job description. Having established a clean dataset (Notebook 1) and pretrained Graph Neural Network (GNN) skill embeddings (Notebook 2), this notebook asks the central research question:
+This notebook is an architectural comparison study for resume-to-job description (JD) matching. The goal is to figure out which model architecture best answers the question: *"How well does this candidate fit this job?"*
 
-> **What is the best way to combine a Transformer's semantic understanding with a GNN's structured skill knowledge for resume-JD matching?**
+The problem with most ATS (Applicant Tracking Systems) out there is that they do keyword matching — if the resume doesn't use the exact words in the job description, the candidate gets filtered out. Someone who writes "built ML pipelines" instead of "machine learning engineering" might get rejected even if they're the best fit. We want to move past that.
 
-The answer is arrived at through a systematic architectural evolution study — starting from a classical baseline, moving through increasingly sophisticated fusion strategies, and ultimately selecting an architecture that balances accuracy with a critical real-world requirement: **explainability and candidate recourse**.
+The broader project has two signals available for matching:
+- **Semantic signal** — what the resume and JD *mean*, captured via a transformer
+- **Skill graph signal** — which concrete skills are mentioned and how they relate to each other, captured via pretrained GNN embeddings (2500 skills × 128 dimensions)
 
----
-
-## Inputs
-
-This notebook depends on outputs from the two preceding notebooks:
-
-| Input | Source | Description |
-|---|---|---|
-| `train_clean.csv` | Notebook 1 (Data Preparation) | 6,241 processed training samples with `resume_text`, `smart_jd_text`, extracted skill lists, and numeric match scores |
-| `test_clean.csv` | Notebook 1 | 1,759 test samples, same schema |
-| `skill_vocab.json` | Notebook 1 | List of 2,500 skill strings used for GNN node indexing |
-| `skill_embeddings.npy` | Notebook 2 (GNN Pretraining) | Pretrained skill embeddings of shape `[2500, 128]` — each skill node's learned representation from the co-occurrence graph |
+This notebook asks: what is the best way to combine those two signals?
 
 ---
 
-## Evaluation Philosophy: Why Ranking Metrics?
+## Dataset
 
-Before any experiments were run, the evaluation strategy had to be defined. This is a deliberate design choice with real practical consequences.
-
-**The Problem with MAE Alone**
-
-Mean Absolute Error measures how close a predicted score is to the true score — but in an ATS context, HR teams don't read raw scores. They look at a ranked list of candidates and act on the top results. A system that scores every candidate at 0.5 (perfectly mediocre) might have low MAE but is completely useless in practice.
-
-**The Chosen Metrics**
-
-| Metric | What It Measures | Why It Matters |
-|---|---|---|
-| **MAE** | Average absolute error in score prediction | Sanity check; lower is better |
-| **Spearman ρ** | Monotonic correlation between predicted and true ranking | Does the model preserve the correct ordering overall? |
-| **nDCG@10** | Did the top 10 ranked candidates match the true top 10? | Directly simulates the HR review experience |
-| **RBO (Rank-Biased Overlap)** | Top-weighted list similarity | Penalizes disagreements at the top of the list more than at the bottom |
-
-The central metric for model selection is **nDCG@10**, since surfacing the right candidates in the top 10 is the real task.
+- **Training set:** 6,241 resume–JD pairs
+- **Test set:** 1,759 resume–JD pairs
+- Each pair has a human-assigned match score (the target), extracted resume skills, extracted JD skills, and the full resume + JD text
+- Skill embeddings are 128-dimensional GNN embeddings pretrained on a skill co-occurrence graph (loaded from `skill_embeddings.npy`)
 
 ---
 
-## The Base Model
+## The Approach: An Architectural Evolution Study
 
-All deep learning architectures in this notebook are built on the same Transformer backbone:
+Rather than jumping straight to the most complex model, we run four architectures in increasing order of sophistication. Each one adds something the previous one was missing. This lets us cleanly see what each addition actually contributes.
 
-**`cross-encoder/ms-marco-MiniLM-L-6-v2`**
+> **Insert architecture diagram: side-by-side overview of all 4 architectures showing inputs, processing, and score output**
 
-This is a lightweight (22M parameter) cross-encoder fine-tuned on passage relevance — a natural fit for resume-JD matching since it already understands the notion of textual relevance between a query and a document. The tokenizer encodes the resume and the smart-parsed JD jointly with a `[SEP]` separator, up to 512 tokens.
+### Transformer Backbone
 
----
+All four deep learning models use `cross-encoder/ms-marco-MiniLM-L-6-v2` as the text encoder. This is a cross-encoder — it takes the resume and JD concatenated together as a single 512-token input, which means the transformer can directly attend between resume tokens and JD tokens. The `[CLS]` token embedding at the end is used as the semantic representation of the pair.
 
-## Experiments
-
-### Experiment 1: The Traditional ATS Baseline (TF-IDF + Cosine Similarity)
-
-**Motivation**
-
-Before building any neural model, a non-neural baseline is essential — both as a sanity check and as a reflection of what most commercial ATS systems actually do. Traditional ATS platforms rely primarily on keyword matching: they count how many words from the job description appear in the resume. TF-IDF with cosine similarity is the rigorous statistical version of this approach.
-
-**Hypothesis**
-
-TF-IDF will perform poorly because it is insensitive to semantic meaning. A candidate who writes "Software Engineering" instead of "Programming," or "built" instead of "developed," will be penalized despite being equally qualified. This is the fundamental limitation that motivates using neural models at all.
-
-**Implementation**
-
-A TF-IDF vectorizer with a 5,000-feature vocabulary was trained on all training resumes and job descriptions combined. At inference time, the resume and JD vectors are compared using cosine similarity, and that similarity score is taken as the predicted match score.
-
-**Results**
-
-| Metric | Score |
-|---|---|
-| MAE | 0.3802 |
-| Spearman ρ | 0.0908 |
-| nDCG@10 | 0.6328 |
-| RBO | 0.3927 |
-
-**What the Results Show**
-
-The near-zero Spearman correlation (0.09) confirms that TF-IDF has almost no ability to rank candidates in the correct order. The nDCG@10 of 0.63, while superficially reasonable, is close to the performance of a randomly-shuffled ranking on an imbalanced dataset — it reflects the class distribution more than genuine discriminative power. These numbers establish the floor: any neural model worth deploying must meaningfully exceed them.
+All models are trained with AdamW (lr=1e-4), MSE loss, batch size 16, for 3 epochs.
 
 ---
 
-### Experiment 2: Pure Semantic (Transformer Only)
+## The Four Architectures
 
-**Motivation**
+### 1. TF-IDF Baseline
 
-Having established the failure mode of keyword matching, the next question is: how much does semantic understanding alone — with no explicit skill graph — improve things? This is the "Resume2Vec" paradigm: encode everything as dense vectors and let the model figure out what matters.
+Before any deep learning, we establish what traditional ATS systems actually do. TF-IDF with cosine similarity — a bag of words representation with no semantic understanding whatsoever.
 
-**Architecture**
+This is the thing we're trying to beat. It's the "null hypothesis" for the whole project.
 
-The MiniLM cross-encoder encodes the resume and JD together. The `[CLS]` token embedding (dimensionality 384) is passed through a two-layer MLP head (384 → 64 → 1) with a sigmoid output to produce a match score in [0, 1].
+### 2. Pure Semantic
 
-```
-Input: [CLS] resume [SEP] smart_jd_text [SEP]
-            ↓
-     MiniLM Transformer (384-dim CLS output)
-            ↓
-     Linear(384→64) → ReLU → Linear(64→1) → Sigmoid
-            ↓
-     Match Score ∈ [0, 1]
-```
+![](../flowcharts/Data flow/data_flow_pure_semantic.png)
 
-The model is trained for 3 epochs with MSE loss against the numeric ground-truth scores (0.0 = No Fit, 0.5 = Potential Fit, 1.0 = Good Fit).
+Text only, no skill graph at all. The transformer handles everything. This is roughly what systems like Resume2Vec do. It captures semantic meaning well (synonyms, paraphrasing) but has no structured understanding of which specific skills are present or absent. It also gives no signal about *which part* of the input drove the score — it's a black box.
 
-**Results**
+![](../flowcharts/Architecture Diagrams/architecture_diagram_pure_semantic.png)
 
-| Metric | Score |
-|---|---|
-| MAE | 0.3767 |
-| Spearman ρ | 0.0899 |
-| nDCG@10 | 0.6453 |
-| RBO | 0.3946 |
+### 3. Late Fusion
 
-**What the Results Show**
+![](../flowcharts/Data flow/arch_2_conceptual_flow.png)
 
-The Pure Semantic model marginally outperforms TF-IDF on MAE and nDCG@10, confirming that semantic understanding does add some value. However, the improvement is small — Spearman barely moves (0.09 → 0.09), and nDCG improves by only 0.013. This tells us something important: **text semantics alone are insufficient for resume-JD matching**. Resumes are structured, skills-driven documents. The Transformer sees word patterns; it doesn't explicitly reason about which skills a candidate has versus which skills the job requires. This motivates adding the GNN skill graph.
+The first architecture that uses both signals. The text embedding and the skill graph embeddings are computed separately and concatenated before the final MLP. The MLP then has to figure out how to weight them.
 
-There is also a practical limitation that semantic-only models share with keyword models: **they are a black box**. A rejected candidate cannot be told "you were ranked 47th because your skill profile matched only 3 of the 8 required technical skills." This is a recourse problem that the later architectures are designed to address.
+**Key architectural decision — JD-Attended Skill Pooler:** The resume skill representation is not a naive mean of all resume skill embeddings. That would give equal weight to every skill the candidate has ever listed, diluting the signal from skills that actually match the JD. Instead, we use a cross-attention module where the **JD skills act as the Query and the resume skills are Key/Value**. This means resume skills that are semantically close to what the JD is asking for get high attention weights, and generic/unrelated skills get suppressed. The JD side uses a plain mean since the JD skills are already the target set by definition.
 
----
+![](../flowcharts/Architecture Diagrams/architecture_diagram_late_fusion.png)
 
-### Experiment 3: Late Fusion (Transformer + GNN by Concatenation)
+### 4. Cross-Attention
 
-**Motivation**
+![](../flowcharts/Data flow/arch_3_conceptual_flow.png)
 
-The obvious first attempt at combining semantic understanding with skill-graph knowledge is to run both modalities independently and concatenate their outputs. This is called "late fusion" because the two representations are merged late in the pipeline, just before the final prediction head. It is the simplest possible fusion strategy and a natural first step beyond the pure semantic model.
+The transformer's token sequence actively attends over the graph skill embeddings. Specifically, the full token sequence is the Query, and the projected skill embeddings are the Keys and Values. This is a tighter integration than Late Fusion — the text representation is shaped by the skill information during the scoring computation rather than being combined at the end.
 
-**Architecture**
+![](../flowcharts/Architecture Diagrams/architecture_diagram_cross_attn.png)
 
-The Transformer produces a 384-dim CLS embedding as before. Simultaneously, the GNN embeddings of the resume's skills and the JD's skills are each mean-pooled into 128-dim vectors, then concatenated into a 256-dim graph feature vector. The two representations are concatenated to form a 640-dim joint vector, which is fed into a final MLP.
+### 5. Mixture of Experts (MoE)
 
-```
-Text stream:  [CLS] → MiniLM → 384-dim CLS embedding
-                                         ↘
-                                   Concat(384+128+128=640)
-                                         ↙
-Graph stream: mean(resume skill embs) → 128-dim              → Linear(640→128) → ReLU → Linear(128→1) → Sigmoid
-              mean(JD skill embs)     → 128-dim
-```
+![](../flowcharts/Data flow/arch_4_conceptual_flow.png)
 
-**Results**
+The key difference from all the others: the two signals are kept **separate all the way through** and only combined at the very end via a learned gating network. The gate takes the CLS embedding + the combined skill representation and outputs two weights (softmax, so they sum to 1) — one for the text expert, one for the graph expert.
 
-| Metric | Score |
-|---|---|
-| MAE | 0.3793 |
-| Spearman ρ | 0.0528 |
-| nDCG@10 | 0.5607 |
-| RBO | 0.4034 |
+This is the architecture we care most about. The reason isn't purely accuracy — it's that keeping the experts separate means we can inspect them. We can see the text score and graph score independently, understand which one drove the final decision, and in a downstream recourse system, tell a candidate *specifically* what to fix (improve your writing/framing vs. acquire these missing skills).
 
-**What the Results Show**
+Same `JDAttendedSkillPooler` as Late Fusion is used here for the graph expert input.
 
-Late Fusion is a disappointment — and an instructive one. Compared to Pure Semantic, nDCG@10 drops sharply (0.6453 → 0.5607), and Spearman correlation also falls (0.0899 → 0.0528). MAE barely changes.
-
-The diagnosis: **mean pooling of skill embeddings loses structural information**, and naively concatenating the two representations doesn't help the model learn which modality to trust in which situation. The text embedding and the graph embedding speak different "languages" and the MLP must bridge that gap without any guidance on how to align them. More problematically, when a resume has very few extracted skills (which is common — many resumes list projects and experience rather than explicit skill keywords), the graph vector is either zeroed out or noisy, actively hurting the prediction. This motivates a more principled fusion strategy.
+![](../flowcharts/Architecture Diagrams/architecture_diagram_moe.png)
 
 ---
 
-### Experiment 4: Cross-Attention Fusion
+## Why These Metrics?
 
-**Motivation**
+HR doesn't care if a score is 0.73 vs 0.81 in absolute terms. What matters is whether the best candidates land at the top of the pile. So we don't evaluate on regression accuracy alone.
 
-The failure of late fusion suggests that the two modalities need to interact more deeply. Rather than concatenating representations after the fact, the Transformer's contextual understanding should be allowed to actively *query* the skill graph — essentially asking: "given the semantic content I've read, which skills in the graph are relevant to pay attention to?" This is the principle behind cross-attention.
-
-**Architecture**
-
-The full sequence output of the Transformer (not just CLS) is used as the query. The skill embeddings for all matched resume and JD skills are projected from 128-dim to 384-dim (to match the Transformer's hidden size) and used as keys and values. A 4-head multi-head attention layer lets the Transformer sequence attend to the skill graph, producing a graph-attended context vector. This is concatenated with the original CLS embedding and fed into the final MLP.
-
-```
-Text:   MiniLM sequence output [batch, seq_len, 384] → Query
-Graph:  skill embs → Linear(128→384) → padded graph seq → Key, Value
-                    ↓
-        MultiheadAttention(embed_dim=384, num_heads=4)
-                    ↓
-        attn_out[:, 0, :]  (CLS position attended output)
-                    ↓
-        Concat[CLS_emb, attn_out] (384+384=768)
-                    ↓
-        Linear(768→64) → ReLU → Linear(64→1) → Sigmoid
-```
-
-**Results**
-
-| Metric | Score |
-|---|---|
-| MAE | 0.3619 |
-| Spearman ρ | 0.1961 |
-| nDCG@10 | 0.6004 |
-| RBO | 0.4070 |
-
-**What the Results Show**
-
-Cross-Attention produces the best MAE (0.3619) and by far the best Spearman correlation (0.1961 — more than double any other model). This confirms the architectural intuition: allowing the text to actively query the skill graph produces a more coherent joint representation than simply appending the two modalities. The model appears to be learning genuine alignment between textual context and skill structure.
-
-However, nDCG@10 (0.6004) is actually lower than Pure Semantic (0.6453). This is a non-trivial finding: the model that best correlates overall rankings may not surface the best candidates at the very top of the list. Cross-Attention's strength is in global ranking fidelity; its weakness may be over-attending to uncommon skill combinations that distort top-k rankings.
-
-Critically, Cross-Attention still has the black-box problem. The attention weights are computed internally between two entangled representations. There is no clean separation between "this candidate ranked highly because of their semantic fit" and "this candidate ranked highly because their hard skills matched." This makes actionable feedback to candidates difficult — and that limitation motivates the final architecture.
+- **nDCG@10** — did the top 10 retrieved candidates match the human's top 10? Penalises highly ranked mistakes heavily
+- **RBO (Rank-Biased Overlap)** — top-weighted list similarity, more robust to list length differences than nDCG
+- **Spearman ρ** — overall monotonic ranking correlation across all pairs
+- **MAE** — included for completeness, but least important for the actual use case
 
 ---
 
-### Experiment 5: Mixture of Experts (MoE) Fusion
+## Results
 
-**Motivation**
-
-The core design requirement driving this architecture is not peak accuracy — it is **explainability and recourse**. In a fair ATS system, a rejected candidate should receive feedback like: "Your semantic profile was a strong match (text score: 0.78) but your extracted hard skills only matched 2 of 8 required skills (graph score: 0.31). Focus on obtaining certifications in Python and AWS." This requires a model with *disentangled* reasoning paths — one expert that scores semantic fit, and a separate expert that scores skill fit — whose outputs are combined transparently.
-
-The additional risk with a two-expert system is **expert collapse**: the gate network learns to always trust one expert and ignore the other, turning MoE into a disguised version of one of the simpler models. Preventing this is a key diagnostic goal.
-
-**Architecture**
-
-Two independent expert networks score their respective modalities, and a learned gating network dynamically weights their contributions per sample.
-
-```
-Text Expert:   CLS embedding (384-dim) → Linear(384→64) → ReLU → Linear(64→1) → Sigmoid → text_score ∈ [0,1]
-
-Graph Expert:  [mean(resume skill embs); mean(JD skill embs)] (256-dim) → Linear(256→64) → ReLU → Linear(64→1) → Sigmoid → graph_score ∈ [0,1]
-
-Gate Network:  Concat[CLS, graph_vec] (384+256=640-dim) → Linear(640→64) → ReLU → Linear(64→2) → Softmax → [w_text, w_graph]
-
-Final Score:   w_text × text_score + w_graph × graph_score
-```
-
-The gate adapts per sample: for a data scientist role with heavy technical requirements, it should upweight the graph expert; for a managerial role emphasizing communication, it should upweight the text expert.
-
-**Results**
-
-| Metric | Score |
-|---|---|
-| MAE | 0.3737 |
-| Spearman ρ | 0.1070 |
-| nDCG@10 | 0.6032 |
-| RBO | 0.4162 |
-
-![](../plots/n_DCG_ranking_1.png)
-
-![](../plots/moe_v1_text_vs_graph_expert.png)
-
-**Expert Collapse Diagnostic**
-
-A scatter plot of `text_score` vs. `graph_score` for all test samples was examined. If the two scores were highly correlated (points hugging the x=y diagonal), it would indicate that one expert had collapsed into the other. The plot confirms that the two experts produce **distinct, non-correlated scores** — points are dispersed away from the collapse line. The gate is genuinely routing different types of samples to different experts.
-
-**What the Results Show**
-
-MoE achieves the highest RBO score (0.4162) of all models — it produces the most top-weighted ranking agreement with human labels. Its nDCG@10 (0.6032) is competitive with Cross-Attention (0.6004) despite being a simpler fusion mechanism. It outperforms Late Fusion on every metric, proving that the key was not the number of components but the architectural philosophy: **experts need separation, not entanglement.**
-
-The MoE does not have the highest nDCG@10 overall (Pure Semantic holds that title among non-Cross-Attention models), but the tradeoff is accepted: a model with disentangled, interpretable scoring paths is worth a marginal drop in top-k accuracy when the downstream goal includes candidate feedback.
-
----
-
-## Full Results Summary
-
-| Model | MAE ↓ | Spearman ρ ↑ | nDCG@10 ↑ | RBO ↑ |
+| Model | MAE ↓ | Spearman ↑ | nDCG@10 ↑ | RBO ↑ |
 |---|---|---|---|---|
-| TF-IDF (Baseline) | 0.3802 | 0.0908 | 0.6328 | 0.3927 |
-| Pure Semantic | 0.3767 | 0.0899 | **0.6453** | 0.3946 |
-| Late Fusion | 0.3793 | 0.0528 | 0.5607 | 0.4034 |
-| Cross-Attention | **0.3619** | **0.1961** | 0.6004 | 0.4070 |
-| MoE (Proposed) | 0.3737 | 0.1070 | 0.6032 | **0.4162** |
+| TF-IDF | 0.3802 | 0.0908 | 0.6328 | 0.3927 |
+| Pure Semantic | 0.3777 | 0.1193 | 0.5956 | 0.3792 |
+| Late Fusion | 0.3528 | 0.2491 | **0.6885** | 0.4166 |
+| Cross-Attention | 0.3627 | 0.1857 | 0.6135 | 0.4123 |
+| **MoE** | 0.3565 | 0.2388 | **0.6893** | **0.4369** |
+
+![](../plots/n_DCG_by_model.png)
+### MoE Expert Specialisation
+
+- **Expert correlation: 0.1304** — the text expert and graph expert are producing meaningfully different scores (a correlation this low confirms they've specialised onto different aspects of the match rather than collapsing into the same representation)
+- The gate weights are not uniformly 0.5/0.5 — the model has learned to trust each expert differently depending on the specific resume-JD pair
+
+![MoE expert scatter — text score vs graph score coloured by true HR label, with y=x collapse line](../plots/text_expert_vs_graph_expert.png)
+
+![gate weight distribution — histogram of graph expert gating weights](../plots/gate_weight_distribution.png)
+
+![MoE predicted score distribution — histogram of final scores](../plots/score_dist_moev1.png)
 
 ---
 
-## Architectural Evolution Summary
+## What We Were Expecting vs What We Got
 
-| Architecture | Core Idea | Key Weakness | Eliminated By |
-|---|---|---|---|
-| TF-IDF | Keyword frequency matching | No semantic understanding | Pure Semantic |
-| Pure Semantic | Transformer contextual encoding | No explicit skill reasoning; black box | MoE / Cross-Attention |
-| Late Fusion | Concatenate text + graph outputs | Mean pooling loses structure; no interaction between modalities | Cross-Attention |
-| Cross-Attention | Text queries the skill graph dynamically | Entangled representations; no explainability | MoE |
-| MoE (chosen) | Separate experts + learned gating | Marginally lower nDCG@10 than Cross-Attention | — |
+**TF-IDF** did pretty much exactly what was expected — competitive on nDCG (0.633) but very weak Spearman (0.091). It can find obvious keyword matches in the top results for some JDs but falls apart overall. The baseline hypothesis was confirmed.
 
----
+**Pure Semantic** was a surprise in the wrong direction. It has the worst nDCG@10 of all models (0.596) and slightly worse RBO than TF-IDF. The hypothesis was that semantics alone would outperform keyword matching — and it does on MAE, but not on ranking. The cross-encoder model likely overfits to surface-level text similarity rather than developing a notion of candidate quality ranking. Worth noting: with only 3 epochs of fine-tuning, the model may simply not have enough signal to rank well across a diverse set of JDs.
 
-## Key Decision: Why MoE Over Cross-Attention?
+**Late Fusion** is the most surprising result — it jumps to 0.689 nDCG and 0.417 RBO, the biggest single improvement in the entire table. Adding structured skill information has a dramatic effect. The JD-attended pooling is doing real work here: before the fix (naive mean pooling), Late Fusion actually scored *worse* than Pure Semantic. The attended pooling is what makes the graph signal useful.
 
-Cross-Attention achieves better MAE and Spearman. Yet MoE is selected as the architecture to carry forward. This is a deliberate choice grounded in the project's applied goal:
+**Cross-Attention** was expected to be the strongest model architecturally because it lets the text representation and skill graph interact at a deep level rather than just concatenating at the end. In practice it underperforms Late Fusion and MoE on almost every metric (nDCG 0.614, Spearman 0.186). One likely reason: the cross-attention projects skill embeddings from 128 to the transformer's hidden dimension (384) and attends over a variable-length padded sequence. The padding and projection may be introducing noise, or the attention mechanism may not be learning useful cross-modal alignment in just 3 epochs. This architecture probably needs more training time and a more careful setup to shine.
 
-**Cross-Attention's limitation:** The fusion happens inside the attention mechanism — there is no clean separation between the contribution of semantic understanding and the contribution of skill matching. Post-hoc explainability tools (e.g., SHAP) could be applied, but they would approximate feature importance after the fact rather than read it directly from the model.
-
-**MoE's advantage:** The text expert score and the graph expert score are explicit, interpretable scalars produced before any fusion. The gating weights are directly readable. This enables Phase 4 of the pipeline (Recourse Generation) to tell a candidate: "Your semantic fit score was X and your skill overlap score was Y" — a statement that comes directly from the model architecture, not from a post-hoc approximation.
-
-The nDCG@10 gap between the two models is small (0.6032 vs. 0.6004, with MoE actually slightly ahead). The explainability gain is large. The decision is: **take the architecture that makes the model's reasoning transparent, and accept the negligible ranking tradeoff.**
+**MoE** lands where we wanted it — best RBO (0.437), near-tied best nDCG (0.689), best Spearman (0.239) among models that use both signals. Crucially, it achieves this while keeping the two experts separate. The expert correlation of 0.13 is strong confirmation that the two pathways are doing different things and not collapsing — the text expert is capturing semantic fit, the graph expert is capturing skill coverage, and the gate is combining them per-pair rather than with a fixed weight.
 
 ---
 
-## Outputs Saved
+## Conclusions
 
-All four trained models are saved to `/kaggle/working/` for downstream use:
+The clearest takeaway is that **structured skill information matters a lot**, but only when it's used correctly. Naive mean pooling of all resume skills (treating them as a single averaged vector regardless of the JD) actively hurts performance — the graph score decreases as you add more general skills to a resume because they dilute the relevant ones. The JD-attended cross-attention pooler fixes this by making the resume skill representation query-conditional: only the resume skills that are relevant to what the JD is asking for contribute meaningfully.
 
-| File | Model | Used By |
-|---|---|---|
-| `best_pure_semantic.pth` | Pure Semantic | Ablation reference |
-| `best_late_fusion.pth` | Late Fusion | Ablation reference |
-| `best_cross_attention.pth` | Cross-Attention | Ablation reference |
-| `best_moe_model.pth` | **Mixture of Experts** | **Notebook 4 (Recourse Generation)** |
+The **MoE is the right architecture for this problem** — not just because it performs well, but because it gives interpretable, separable expert signals. The Cross-Attention being weaker than expected suggests that tight early fusion isn't necessarily better than clean late fusion, at least at this scale and training budget.
+
+The **Spearman scores across the board are low** (best is 0.249). This is expected behaviour for a task like this — within a pool of candidates for a single JD, there are genuine ambiguities in human scoring. Two candidates with scores of 0.6 and 0.65 may be nearly identical, and the model can't be expected to perfectly resolve that ordering. nDCG and RBO are more meaningful indicators for the actual use case, and those numbers are much more encouraging.
+
+---
+
+## Files Saved
+
+All four deep learning models are saved as state dicts to `/kaggle/working/`:
+
+- `best_pure_semantic.pth`
+- `best_late_fusion.pth`
+- `best_cross_attention.pth`
+- `best_moe_model.pth`
+
+These are used in the downstream recourse phase where the MoE's separate expert scores drive candidate-specific feedback.
+
+---
+
+## Dependencies
+
+```
+transformers==5.2.0
+torch
+scikit-learn
+scipy
+seaborn
+matplotlib
+pandas
+numpy
+tqdm
+```
+
+Backbone model: `cross-encoder/ms-marco-MiniLM-L-6-v2` (HuggingFace)
