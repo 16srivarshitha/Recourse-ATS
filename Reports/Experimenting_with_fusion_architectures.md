@@ -45,33 +45,33 @@ This is the thing we're trying to beat. It's the "null hypothesis" for the whole
 
 ### 2. Pure Semantic
 
-![](../flowcharts/Data flow/data_flow_pure_semantic.png)
+![](../flowcharts/Data%20flow/data_flow_pure_semantic.png)
 
 Text only, no skill graph at all. The transformer handles everything. This is roughly what systems like Resume2Vec do. It captures semantic meaning well (synonyms, paraphrasing) but has no structured understanding of which specific skills are present or absent. It also gives no signal about *which part* of the input drove the score — it's a black box.
 
-![](../flowcharts/Architecture Diagrams/architecture_diagram_pure_semantic.png)
+![](../flowcharts/Architecture%20Diagrams/architecture_diagram_pure_semantic.png)
 
 ### 3. Late Fusion
 
-![](../flowcharts/Data flow/arch_2_conceptual_flow.png)
+![](../flowcharts/Data%20flow/arch_2_conceptual_flow.png)
 
 The first architecture that uses both signals. The text embedding and the skill graph embeddings are computed separately and concatenated before the final MLP. The MLP then has to figure out how to weight them.
 
 **Key architectural decision — JD-Attended Skill Pooler:** The resume skill representation is not a naive mean of all resume skill embeddings. That would give equal weight to every skill the candidate has ever listed, diluting the signal from skills that actually match the JD. Instead, we use a cross-attention module where the **JD skills act as the Query and the resume skills are Key/Value**. This means resume skills that are semantically close to what the JD is asking for get high attention weights, and generic/unrelated skills get suppressed. The JD side uses a plain mean since the JD skills are already the target set by definition.
 
-![](../flowcharts/Architecture Diagrams/architecture_diagram_late_fusion.png)
+![](../flowcharts/Architecture%20Diagrams/architecture_diagram_late_fusion.png)
 
 ### 4. Cross-Attention
 
-![](../flowcharts/Data flow/arch_3_conceptual_flow.png)
+![](../flowcharts/Data%20flow/arch_3_conceptual_flow.png)
 
 The transformer's token sequence actively attends over the graph skill embeddings. Specifically, the full token sequence is the Query, and the projected skill embeddings are the Keys and Values. This is a tighter integration than Late Fusion — the text representation is shaped by the skill information during the scoring computation rather than being combined at the end.
 
-![](../flowcharts/Architecture Diagrams/architecture_diagram_cross_attn.png)
+![](../flowcharts/Architecture%20Diagrams/architecture_diagram_cross_attn.png)
 
 ### 5. Mixture of Experts (MoE)
 
-![](../flowcharts/Data flow/arch_4_conceptual_flow.png)
+![](../flowcharts/Data%20flow/arch_4_conceptual_flow.png)
 
 The key difference from all the others: the two signals are kept **separate all the way through** and only combined at the very end via a learned gating network. The gate takes the CLS embedding + the combined skill representation and outputs two weights (softmax, so they sum to 1) — one for the text expert, one for the graph expert.
 
@@ -79,7 +79,7 @@ This is the architecture we care most about. The reason isn't purely accuracy �
 
 Same `JDAttendedSkillPooler` as Late Fusion is used here for the graph expert input.
 
-![](../flowcharts/Architecture Diagrams/architecture_diagram_moe.png)
+![](../flowcharts/Architecture%20Diagrams/architecture_diagram_moe.png)
 
 ---
 
