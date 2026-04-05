@@ -27,8 +27,6 @@ This notebook asks: what is the best way to combine those two signals?
 
 Rather than jumping straight to the most complex model, we run four architectures in increasing order of sophistication. Each one adds something the previous one was missing. This lets us cleanly see what each addition actually contributes.
 
-> **Insert architecture diagram: side-by-side overview of all 4 architectures showing inputs, processing, and score output**
-
 ### Transformer Backbone
 
 All four deep learning models use `cross-encoder/ms-marco-MiniLM-L-6-v2` as the text encoder. This is a cross-encoder — it takes the resume and JD concatenated together as a single 512-token input, which means the transformer can directly attend between resume tokens and JD tokens. The `[CLS]` token embedding at the end is used as the semantic representation of the pair.
