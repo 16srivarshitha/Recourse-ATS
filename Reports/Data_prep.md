@@ -4,6 +4,8 @@
 
 This notebook is the **first stage** of a multi-notebook NLP pipeline that predicts how well a resume matches a job description. The goal is to build a hybrid model combining Transformer-based text understanding with Graph Neural Networks (GNNs) that understand skill relationships — but before any model can be trained, the data must be carefully understood, cleaned, and engineered.
 
+![](../flowcharts/Data%20flow/data_flow_notebook1.png)
+
 ---
 
 ## Datasets Used
@@ -65,50 +67,18 @@ Before any analysis, both the primary dataset and the LinkedIn skills dataset ar
 Before any modelling decision, understanding class balance is critical. An imbalanced dataset causes a classifier to be biased toward the majority class, giving misleadingly high accuracy while failing on minority classes.
 
 ### What We Found
+The dataset is **moderately imbalanced** — "No Fit" is roughly twice as common as either positive class. 
 
-The dataset is **moderately imbalanced** — "No Fit" is roughly twice as common as either positive class. This means:
-- A naive classifier that always predicts "No Fit" would get ~50% accuracy.
-- The model needs to be evaluated on **macro-averaged F1** or **AUC**, not just accuracy.
-- Class weighting or oversampling may be needed in later training stages.
-
-### Numeric Label Mapping
-Labels are mapped to scores for potential regression-style training:
-
-| Label | Score |
-|---|---|
-| No Fit | 0.0 |
-| Potential Fit | 0.5 |
-| Good Fit | 1.0 |
+![label_distribution_train_set.png](../plots/label_distribution.png)
 
 ---
 
 ## Word Count Analysis
 
 ### Why This Matters — The Transformer Token Limit Problem
-
 Transformer models like BERT and RoBERTa have a hard limit of **512 tokens** (approximately 350–400 words). Any text beyond this limit is simply **truncated** — the model never sees it.
 
-### Resume Length Stats (Train Set, Tech-filtered, n=6,166)
-
-| Statistic | Words |
-|---|---|
-| Mean | 708 |
-| Median (50th) | 618 |
-| 75th percentile | 810 |
-| 90th percentile | 1,153 |
-| 95th percentile | 1,591 |
-| Max | 3,134 |
-
-### Job Description Length Stats (Train Set, Tech-filtered, n=6,166)
-
-| Statistic | Words |
-|---|---|
-| Mean | 375 |
-| Median (50th) | 330 |
-| 75th percentile | 532 |
-| 90th percentile | 696 |
-| 95th percentile | 810 |
-| Max | 1,079 |
+![](../plots/JD_words_count.png)
 
 **Key Observation:** While the median JD is ~330 words (within the Transformer limit), a significant portion of JDs exceed 400 words. And as we show next, the *critical* content of those JDs often appears *after* the cutoff.
 
@@ -117,19 +87,14 @@ Transformer models like BERT and RoBERTa have a hard limit of **512 tokens** (ap
 ## The Hidden Requirements Problem (Key Data Insight)
 
 ### Hypothesis
-Job descriptions typically open with company branding, culture statements, and role overviews — all of which are relatively uninformative for matching. The actual **technical requirements and qualifications** often appear much later in the document.
+Job descriptions typically open with company branding, culture statements, and role overviews. The actual **technical requirements and qualifications** often appear much later in the document.
 
-If the Transformer truncates a JD at word 384, and the Requirements section starts at word 450, the model will read only marketing text and miss everything that matters.
+### Analysis & Result
+A function locates the keywords `"requirements"`, `"qualifications"`, and `"what you need"` within each JD and measures the word position at which they first appear.
 
-### Analysis
-
-A function locates the keywords `"requirements"`, `"qualifications"`, and `"what you need"` within each JD (checked in that priority order) and measures the word position at which they first appear.
-
-### Result
+![requirements_start_word_histogram.png](../plots/Requirements_word_index.png)
 
 **462 job descriptions in the training set had their requirements section appearing *after* the typical Transformer cutoff (~384 words).**
-
-This is not a small edge case — it affects 7.5% of the training data, and those are precisely the samples where the Transformer would be most likely to make wrong predictions.
 
 ---
 
@@ -156,8 +121,6 @@ This ensures the Transformer reads the **most discriminative content** in the JD
 
 The output is stored in a new column: `smart_jd_text`.
 
----
-
 ## Dual Pipeline for Graph vs. Transformer
 
 ### Why Two Pipelines?
@@ -167,8 +130,6 @@ The architecture uses two different models that have different text requirements
 1. **Transformer (RoBERTa/BERT):** Works on raw, natural text. It relies on **stopwords, punctuation, and grammar** for context. A sentence like "does NOT require Python" changes meaning entirely if "NOT" is removed.
 
 2. **Graph Neural Network (GNN):** Needs to identify **skill entities** in text. For this, we need clean text and fast keyword matching. Stopwords add noise here, not signal.
-
-### The Dual Pipeline
 
 | Column | Used By | Processing |
 |---|---|---|
@@ -202,7 +163,7 @@ The full pipeline on the LinkedIn tech-filtered dataset (40,745 rows):
 3. Drop skills with fewer than 2 or more than 40 characters.
 4. Filter out noise phrases (`"this context does not mention"`, `"none found"`).
 5. Apply a **blocklist** of soft skills and non-technical terms — `communication`, `teamwork`, `leadership`, `problem solving`, `bachelor's degree`, `computer science`, `software engineering`, etc. These terms are pervasive in the raw data (e.g. `communication` appears 7,104 times before filtering) but carry no signal for GNN skill-graph matching.
-6. Rank by frequency and keep the **top 2,500**.
+6. Rank by frequency. We found an incredible **155,818 unique skills/phrases**, but we restricted the final vocabulary to the **top 2,500** most frequent terms to keep the graph focused and dense.
 
 The top technical skills after blocklist filtering are: `python` (12,336), `sql` (8,274), `java` (7,984), `aws` (7,582), `kubernetes` (4,860), `javascript` (4,830), `docker` (4,525), `agile` (4,445), `machine learning` (3,975).
 
@@ -211,6 +172,8 @@ After vocabulary construction, a **synonym map** is applied via FlashText's alia
 ### Skill Extraction Results
 
 Most resumes contain 5–25 extracted skills and most JDs contain 3–15 skills — dense enough to build meaningful skill overlap features, sparse enough to avoid noise.
+
+![](../plots/Density_hard_skills.png)
 
 ---
 
@@ -225,9 +188,9 @@ For each job posting, all valid skills present in the 2,502-skill vocabulary are
 
 | Metric | Value |
 |---|---|
-| Total unique skill pairs computed | 790,165 |
+| Total unique skill pairs computed | **740,444** |
 
-All 790,165 edges are saved directly — no sparsification step is applied in this notebook.
+All 740,444 edges are saved directly — no sparsification step is applied in this notebook.
 
 ### Top 10 Strongest Skill Connections
 
@@ -245,19 +208,20 @@ All 790,165 edges are saved directly — no sparsification step is applied in th
 | docker | python | 2,963 |
 
 These relationships reflect real-world technical skill clusters — cloud and container tooling (`aws`, `docker`, `kubernetes`) co-occurring heavily with core languages (`python`, `java`, `sql`). Note that the blocklist successfully removed soft-skill terms like `communication` from these edges; the strongest connections are entirely technical.
+...
 
 ---
 
 ## Outputs Produced
 
-All outputs are saved to `/kaggle/working/` for downstream notebooks:
+All outputs are saved to `/kaggle/working/` for downstream notebooks. Note that the datasets now include the Groq skill extraction columns as part of the overall pipeline:
 
 | File | Contents | Used By |
 |---|---|---|
-| `train_clean.csv` | Processed train data with all new columns | Notebook 3 (model training) |
+| `train_clean.csv` | Processed train data with all new columns (including FlashText + Groq skill columns) | Notebook 3 (model training) |
 | `test_clean.csv` | Processed test data | Notebook 3 |
 | `skill_vocab.json` | 2,502 skill strings (FlashText vocab + synonyms) | Notebook 2 (GNN pretraining) |
-| `graph_edges.json` | 790,165 `{source, target, weight}` co-occurrence pairs | Notebook 2 |
+| `graph_edges.json` | **740,444** `{source, target, weight}` co-occurrence pairs | Notebook 2 |
 
 ### Columns in `train_clean.csv` / `test_clean.csv`
 
@@ -290,4 +254,4 @@ All outputs are saved to `/kaggle/working/` for downstream notebooks:
 | FlashText with 2,502 skills + synonyms | Regex with 500 skills | O(N) speed; 5× larger vocabulary at no performance cost; synonym map handles abbreviations |
 | Dual text pipelines (raw vs. cleaned) | Single pipeline | Transformer needs stopwords for context; GNN needs clean text for entity matching |
 | Soft-skills blocklist in vocab construction | Keep all frequent skills | Removes high-frequency noise (e.g. `communication` at 7,104 raw occurrences) that would otherwise dominate the graph edges |
-| All 790,165 co-occurrence edges saved | Sparsify at min weight | No sparsification applied in this notebook; filtering can be done downstream if needed |
+| All **740,444** co-occurrence edges saved | Sparsify at min weight | No sparsification applied in this notebook; filtering can be done downstream if needed |
