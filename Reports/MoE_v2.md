@@ -1,268 +1,131 @@
 # Notebook 4: MoE v2 — Full Rewrite for Interpretable Resume-JD Fit Scoring
 
 ## Project Overview
+This notebook represents the **fourth stage** of the pipeline and serves as a direct, engineered response to the failure modes observed in MoE v1. While Notebook 3 proved that a Mixture of Experts (MoE) architecture conceptually works for explainable resume-JD scoring, v1 suffered from severe mode collapse and representation mismatch.
 
-This notebook is the **fourth stage** of the pipeline and a direct response to the failure modes of MoE v1. Having established in Notebook 3 that a Mixture of Experts architecture is the right foundation for explainable resume-JD scoring, this notebook asks: *what exactly was wrong with v1, and how do we fix each thing properly?*
-
-Every change in v2 is motivated by a specific, diagnosed failure in v1. The goal was to come up with an architecture that is more honest and something that does what it claims to do.
-
----
-![Overall flow chart](../plots/moe_flowchart.png)
-
-## What Changed from v1 and Why
-
-| Component | v1 Problem | v2 Fix |
-|---|---|---|
-| TextExpert | Cross-encoder used as bi-encoder → representations were fundamentally incorrect | Switch to `all-MiniLM-L6-v2`, a pretrained bi-encoder |
-| GraphExpert | Raw cosine on dense GNN embeddings → always ~1.0, no discrimination | Neighbourhood contextualisation + cross-attention |
-| Gate | Only sees 2 scalar scores → blind to how much graph evidence is available | Add normalised resume skill count as a third gate input |
-| Loss | MSE only → doesn't optimise ranking directly | MSE + margin ranking loss + auxiliary graph loss |
+This notebook asks: *What exactly went wrong with v1, what were the alternatives, and how do we fix each component properly?*
 
 ---
+![Overall flow chart](../flowcharts/Data%20flow/data_flow_moe_v2.png)
 
-## Inputs
+## 1. What Changed from v1 and Why (Summary)
 
-| Input | Source | Description |
-|---|---|---|
-| `train_clean.csv` | Notebook 1 | 6,241 training samples with resume text, smart-parsed JD text, extracted skill lists, and numeric match scores |
-| `test_clean.csv` | Notebook 1 | 1,759 test samples |
-| `skill_vocab.json` | Notebook 1 | 2,500-skill vocabulary for GNN node indexing |
-| `skill_embeddings.npy` | Notebook 2 | Pretrained GNN skill embeddings, shape `[2500, 128]` |
-| `graph_edges.json` | Notebook 1 | Skill co-occurrence edges — used here to compute inverse-degree weights |
-
----
-
-## Experiment 1: Diagnosing the Jaccard Distribution Problem
-
-### Motivation
-
-Before redesigning the GraphExpert, the nature of the skill overlap signal needed to be understood. Jaccard similarity between resume and JD skill sets is the natural ground truth for the graph expert — it measures exactly what it should: what fraction of required skills are covered. But if the Jaccard distribution is heavily skewed, naive training on it will cause the expert to collapse.
-
-### What Was Measured
-
-Jaccard similarity was computed for all 6,241 training pairs:
-
-| Statistic | Value |
-|---|---|
-| Mean | 0.0625 |
-| Std | 0.0428 |
-| 25th percentile | 0.0299 |
-| Median | 0.0568 |
-| 75th percentile | 0.0882 |
-| 95th percentile | 0.1429 |
-| Max | 0.2687 |
-
-### What the Results Show
-
-The distribution is extremely skewed — the vast majority of resume-JD pairs share very few overlapping skills, with a mean overlap of just 6.25% and a maximum of only 26.87%. This is a direct consequence of the 2,500-skill vocabulary being large enough that any two documents will use different skill subsets even if they are semantically related.
-
-This diagnosis had two immediate consequences for the v2 design:
-
-**First**, binary BCE classification was ruled out as a pretraining target. With 99.5% of pairs having Jaccard below 0.2, a classifier would learn to always predict "no overlap" and achieve near-perfect accuracy while learning nothing useful. The correct target is regression against the raw Jaccard value.
-
-**Second**, uniform sampling during pretraining was ruled out. With so few high-overlap pairs, a uniformly-sampled epoch would be dominated by near-zero Jaccard pairs, and the expert would converge to predicting a constant near-zero value — i.e., collapse. This motivated the weighted sampler introduced in the next experiment.
-
----
-
-## Experiment 2: GraphExpert Redesign — Contextualisation + Cross-Attention
-
-### Motivation
-
-In v1, the GraphExpert computed raw cosine similarity between mean-pooled resume skill embeddings and mean-pooled JD skill embeddings. This produced scores that were always approximately 1.0 — useless for discrimination. The root cause: GNN embeddings are dense 128-dimensional vectors trained to encode skill semantics. Any two sets of skills, even unrelated ones, will produce mean embeddings that are geometrically close in this space. Raw cosine on dense GNN vectors is not a reliable skill overlap signal.
-
-### The Key Insight: Skills Are Context-Dependent
-
-"Python" in a resume that also contains "TensorFlow," "RAG," and "PyTorch" signals a machine learning background. "Python" in a resume with "JavaScript," "CSS," and "React" signals web development. The GNN embedding for Python is the same in both cases — it encodes what Python *is*, not what it *means in context*. To score skill coverage properly, the resume skill embeddings need to be contextualised before comparison.
-
-### Architecture: Two Steps Before Scoring
-
-**Step 1 — Neighbourhood Aggregation (Contextualisation)**
-
-For each resume, the skill embeddings are updated using a weighted average of the other skills in that same resume. Specifically, L2-normalised cosine similarities between all skill pairs in the resume are used as attention weights, and each skill's representation is updated as a 50/50 blend of its original embedding and the weighted average of its neighbours:
-
-```
-normed  = L2_normalize(skill_embs)          # (N_skills, 128)
-sim     = normed @ normed.T                  # (N_skills, N_skills)
-sim.fill_diagonal_(0.0)                      # exclude self
-attn    = softmax(sim, dim=1)                # row-normalised attention
-context = attn @ skill_embs                  # (N_skills, 128)
-output  = 0.5 * skill_embs + 0.5 * context  # residual blend
-```
-
-After this step, Python+TensorFlow and Python+JavaScript produce different contextualised representations of Python.
-
-**Step 2 — Cross-Attention (JD queries Resume)**
-
-The JD skills act as the query, and the contextualised resume skills act as keys and values. A 4-head multi-head attention layer computes how well each JD requirement is covered by the resume skill set. The softmax in the attention mechanism forces discrimination even when the underlying cosine similarities are all high — it must choose which resume skills are most relevant to each JD skill, rather than distributing attention uniformly.
-
-```
-Q = jd_embs (weighted by inverse-degree)   # (N_jd, 128)
-K = V = contextualised resume skill embs   # (N_res, 128)
-attn_out = MultiheadAttention(Q, K, V)      # (N_jd, 128)
-attn_out = LayerNorm(attn_out)              # prevent scale drift
-pooled   = mean(attn_out)                   # (128,)
-score    = score_head(pooled)               # scalar ∈ [0,1]
-```
-
-**Inverse-Degree Weighting on JD Skills**
-
-Rare skills in the JD (skills that co-occur with few others in the LinkedIn corpus) are upweighted before attention. The intuition: if a JD requires "CUDA programming," that is far more discriminative than requiring "communication." A candidate who has CUDA should be rewarded more than one who has communication. The weight is computed as inverse degree from the co-occurrence graph, normalised to [0,1].
-
-**Stability Additions**
-
-Three additions were made specifically to prevent the expert from misbehaving during MoE training:
-- `LayerNorm` on the cross-attention output (prevents scale drift as the text expert dominates gradients)
-- Xavier initialisation on the `score_head` with small gain on the final layer (`gain=0.01`)
-- Constant bias of -1.0 on the final linear layer (biases the expert toward lower outputs initially, preventing early saturation at 1.0)
-
----
-
-## Experiment 3: GraphExpert Pretraining — Solving the Imbalance and Strength Gap
-
-### Motivation — The Asymmetric Start Problem
-
-When MoE v1 began joint training, the text expert arrived with strong pretrained weights (a cross-encoder fine-tuned on relevance). The graph expert started from random initialisation. The gate network, which sees the outputs of both experts, immediately learned that the text expert's scores are informative and the graph expert's are random noise. It suppressed the graph expert from epoch 1, and the graph expert never received useful gradient signal to improve. This is a **self-fulfilling collapse**: the gate ignores the expert, so the expert never learns, so the gate is correct to ignore it.
-
-The fix is to pretrain the graph expert standalone before handing it to the MoE, so both experts arrive at joint training at roughly comparable quality.
-
-### Pretraining Task
-
-The graph expert is pretrained to predict Jaccard similarity via MSE regression. Because the raw Jaccard values are all below 0.30 (as established in Experiment 1), the target is normalised by `JACCARD_MAX = 0.30` and clipped to [0,1], so that a pair with maximum observed overlap maps to a target of 1.0 rather than 0.27.
-
-### The Weighted Sampler
-
-Standard epoch sampling would overwhelmingly draw near-zero Jaccard pairs, causing the expert to converge to predicting ~0. A `WeightedRandomSampler` oversamples high-overlap pairs proportional to `sqrt(Jaccard) + 0.02`:
-
-- `sqrt()` stretches the upper end of the distribution, giving high-overlap pairs relatively greater weight
-- `+ 0.02` epsilon keeps zero-overlap pairs in the mix so the expert doesn't lose the ability to predict low overlap
-
-### Collapse Check Before Handing to MoE
-
-After pretraining, the expert's score distribution was checked on a held-out batch:
-
-| Check | Untrained Expert | After Pretraining |
-|---|---|---|
-| Mean score | 0.2716 | 0.2541 |
-| Std score | 0.0007 | 0.0358 |
-
-The untrained expert had a standard deviation of 0.0007 — essentially a constant output, i.e., already collapsed before training even began. After 10 epochs of pretraining, std rose to 0.0358. The threshold for a healthy expert is defined as `std > 0.05` (collapsed = `std < 0.02`). At 0.0358, the expert is alive and discriminating, though the std is still below the ideal threshold — room to improve further during MoE training.
-
----
-
-## Experiment 4: Gating Network Redesign
-
-### Motivation
-
-In v1, the gate received only two inputs: the text score and the graph score. This meant it was blind to a crucial piece of information: *how much skill evidence is available* in the resume. A resume with 2 extracted skills should lean heavily on the text expert — there is not enough graph signal to trust. A resume with 20 skills should lean on the graph expert. The gate had no way to learn this without the skill count as an explicit feature.
-
-### Architecture
-
-The gate now takes three inputs: the text score, the graph score, and the normalised resume skill count (number of extracted skills divided by the maximum observed across all resumes, which was 176).
-
-```
-inputs = [text_score, graph_score, skill_count / 176]  # (B, 3)
-gates  = Linear(3→16) → ReLU → Linear(16→2) → Softmax  # (B, 2)
-```
-
-### Gate Floor
-
-To prevent the gate from completely suppressing the graph expert even when it is functioning correctly, a **gate floor** of 0.15 is applied: the graph expert's gate weight is clamped to a minimum of 15%, and both weights are renormalised to sum to 1. This ensures the graph expert always contributes at least 15% to the final score, preserving the disentangled signal needed for recourse generation in Notebook 5.
-
----
-
-## Experiment 5: Combined Loss Function
-
-### Motivation
-
-MSE alone optimises score accuracy — but the downstream application is ranking, not scoring. A model that perfectly predicts 0.0, 0.5, and 1.0 is great, but the real requirement is that Good Fit candidates are ranked above Potential Fit candidates, who are ranked above No Fit candidates. MSE is blind to the ordering relationship between samples in the same batch.
-
-Additionally, having invested in a pretrained graph expert, there needed to be a mechanism to prevent MoE training from re-collapsing it. The combined text + ranking loss gradient is strong and would tend to push the graph expert away from its pretraining signal if no anchoring term was maintained.
-
-### Three Loss Terms
-
-**MSE Loss (weight: α = 0.5)** — penalises absolute error in score prediction. Preserves score calibration.
-
-**Margin Ranking Loss (weight: 1 − α = 0.5)** — for every pair of samples in the batch with different true labels, enforces that the higher-labelled sample scores at least `RANKING_MARGIN = 0.20` above the lower-labelled sample. If a Good Fit does not score at least 0.20 above a No Fit, a penalty is incurred.
-
-**Auxiliary Graph Loss (weight: β = 0.1)** — the graph expert's raw output is also trained against the Jaccard target during MoE training. This light anchoring keeps the graph expert grounded in its pretraining task throughout joint training, preventing the combined loss from erasing the skill-matching signal the expert learned during pretraining.
-
-```
-total_loss = 0.5 × MSE + 0.5 × MarginRankingLoss + 0.1 × GraphAuxMSE
-```
-
----
-
-## Experiment 6: Training with Collapse Guards
-
-### Motivation
-
-Even with a pretrained graph expert and a gate floor, there remained a risk of gradual graph expert collapse during joint training — the text expert's encoder has 22M parameters, and its gradients are correspondingly large relative to the graph expert's cross-attention. Differential learning rates and an active monitoring guard were added to address this.
-
-### Differential Learning Rates
-
-```
-text_expert:  lr / 10  (pretrained bi-encoder — keep stable)
-graph_expert: lr       (pretrained but adapts to MoE context)
-gate:         lr       (new — needs full learning rate)
-```
-
-The text expert receives one-tenth of the base learning rate. This prevents the dominant encoder from overwriting the graph expert's signal and ensures both experts adapt at comparable rates relative to their parameter counts.
-
-### Live Collapse Guard
-
-During each epoch, the mean graph expert score is monitored. If it drops below 0.05 — the threshold indicating the expert is outputting near-constant low scores — the graph expert's learning rate is doubled for the next epoch to push it back toward a useful range.
-
-### Training Log
-
-| Epoch | Loss | Text Expert Mean | Graph Expert Mean |
+| Component | Alternative / v1 Approach | Why it Failed | Chosen v2 Fix |
 |---|---|---|---|
-| 1 | 0.1505 | 0.6312 | 0.2122 |
-| 2 | 0.1228 | 0.6261 | 0.1668 |
-| 3 | 0.1075 | 0.6201 | 0.1384 |
-| 4 | 0.0982 | 0.6157 | 0.1222 |
-| 5 | 0.0878 | 0.6045 | 0.1072 |
-
-The graph expert mean drifted downward over 5 epochs (0.21 → 0.11) but never triggered the collapse guard (threshold: 0.05). Loss decreased steadily, confirming convergence. However, the downward drift in the graph expert mean is worth watching — additional epochs may approach the threshold and trigger the guard.
+| **TextExpert** | Cross-encoder used as a bi-encoder. | Cross-encoders require joint input (Resume + JD). Encoding them separately produces mathematically incompatible representations. | Switch to `all-MiniLM-L6-v2`, a model explicitly pretrained as a **bi-encoder**. |
+| **GraphExpert** | Mean-pooling GNN embeddings → Cosine Similarity. | Dense GNN space makes all mean-pooled vectors geometrically close. Cosine sim was always ~1.0, offering no discrimination. | **Neighbourhood contextualisation** followed by **Cross-Attention** (JD queries Resume). |
+| **Gate** | Inputs: [Text Score, Graph Score]. | The gate was blind to how much graph evidence was available, suppressing the graph even for skill-heavy resumes. | Added **normalised resume skill count** as a 3rd input, plus a **0.15 Gate Floor**. |
+| **Loss** | Pure MSE (Mean Squared Error). | MSE only optimises absolute score accuracy. It is blind to the relative ordering of candidates (Ranking). | **MSE + Margin Ranking Loss** + **Auxiliary Graph Loss** to anchor the expert. |
+| **Training** | Uniform learning rate, joint training from scratch. | The pretrained Text expert dominated early, causing the gate to permanently ignore the untrained Graph expert. | **Standalone pretraining** for the Graph expert, **differential LRs**, and a **live collapse guard**. |
 
 ---
 
-## Collapse Diagnostics
+## Architecture Diagram
+![](../flowcharts/Architecture%20Diagrams/architecture_diagram_moev2.png)
 
-After training, expert outputs and gate weights were analysed across the full test set:
+## 2. Diagnosing the Skill Overlap (Jaccard) Distribution
 
-### Expert Score Statistics
+### The Problem
+Before redesigning the GraphExpert, we needed to understand the ground truth it was trying to predict: the Jaccard similarity (skill overlap) between the Resume and the JD. 
 
-| Expert | Mean | Std | Status |
-|---|---|---|---|
-| Text Expert | 0.570 | 0.209 | ✓ Healthy |
-| Graph Expert | 0.098 | 0.059 | ✓ Healthy (std > 0.05 threshold) |
+### The Observation
+We computed Jaccard similarities for all 6,166 training pairs. The results were highly skewed:
+* **Mean:** 0.0527
+* **Median:** 0.0476
+* **95th percentile:** 0.1250
+* **Max:** 0.3333
 
-The graph expert's std of 0.059 clears the healthy threshold of 0.05, confirming it is producing discriminating outputs and has not collapsed.
-
-### Gate Weight Statistics
-
-| Weight | Mean |
-|---|---|
-| Mean text gate weight | 0.622 |
-| Mean graph gate weight | 0.378 |
-
-The gate allocates roughly 62% text / 38% graph on average — a significant improvement over v1, where the graph expert's gate weight was near-zero for many samples.
-
-![**Plot 1: Expert score distributions**](../plots/expert_score_distribution_moev2.png)
-
-Overlapping histograms of text expert scores (blue) and graph expert scores (coral). The text expert shows a wider, higher-mean distribution; the graph expert shows a distinct, narrower distribution not concentrated at 0 or 1.
-
-![**Plot 2: Gate weight distributions**](../plots/gate_weight_distributions_moev2.png)
-
- Histograms of text gate weights (blue) and graph gate weights (coral). The shape of these distributions shows how often the gate routes strongly toward one expert versus splitting evenly.
-
-![**Plot 3: Skill count vs. graph gate weight**](../plots/skill_count_vs_graph_gate_weight.png)
-
- Scatter plot with normalised skill count on the x-axis and graph gate weight on the y-axis. An upward trend confirms the gate has learned that more skills = more graph evidence = higher graph weight.
+### Design Decision: Pretraining Target & Sampling
+* **Alternative Considered:** Train the Graph Expert from scratch using standard BCE Loss (Overlap vs. No Overlap) with uniform batch sampling.
+* **Why it Failed:** Because 95% of the data has less than 12.5% overlap, the negative class heavily dominates. A classifier learns to predict `0` for everything, achieving 95% accuracy while learning absolutely no skill-matching semantics (Model Collapse).
+* **Chosen Approach:** We framed pretraining as a Binary Classification task (`>10%` overlap = Positive) but introduced a `WeightedRandomSampler`. High-overlap pairs are oversampled proportional to `sqrt(Jaccard) + 0.02`. This forces the expert to see the full spectrum of overlaps during every epoch.
 
 ---
 
-## Full Results — All Architectures
+## 3. GraphExpert Redesign: Context-Aware Skill Matching
+
+### The Problem
+In v1, "Python" had the exact same embedding regardless of the resume. But skills are context-dependent:
+* `Python` + `TensorFlow` + `RAG` = Machine Learning context.
+* `Python` + `JavaScript` + `CSS` = Web Development context.
+
+### The Chosen Architecture
+We handle this with a two-step mechanism before scoring:
+
+1. **Neighbourhood Aggregation (Contextualisation):** 
+   We update each resume skill embedding using a self-attention mechanism over the other skills in that specific resume. The representation becomes a 50/50 residual blend of its original GNN embedding and its neighbourhood context.
+2. **Cross-Attention & Inverse-Degree Weighting:**
+   The JD skills (queries) attend over the contextualised resume skills (keys/values). We apply **inverse-degree weighting** to the JD skills: rare skills (e.g., "CUDA") receive higher weights than generic skills (e.g., "Communication"). Softmax forces the model to pick the best matching resume skill for each JD requirement.
+
+*Stability Observation:* To prevent gradients from blowing up, we added `LayerNorm` after cross-attention and initialized the final linear layer with a tiny weight gain (`0.01`) and a bias of `-1.0` to prevent early saturation.
+
+---
+
+## 4. The Self-Fulfilling Collapse & Differential Training
+
+### The Problem
+In early MoE trials, the Text expert (pretrained BERT) was already highly accurate. The Graph expert (randomly initialized) outputted noise. The Gating network immediately learned to multiply the Graph expert by `0.0`. Consequently, the Graph expert received no gradients, never improved, and the gate was continuously "correct" to ignore it. 
+
+### The Chosen Fixes
+1. **Pretraining:** The Graph expert is pretrained standalone for 10 epochs to ensure it arrives at joint training with a strong, discriminative signal.
+2. **Differential Learning Rates:** During joint training, the Text expert uses `lr / 10` (to preserve its pretrained weights), while the Graph expert and Gate use the full `lr`. 
+3. **Live Collapse Guard:** A callback checks the mean output of the Graph expert. If it falls below `0.05` in any epoch, the Graph and Gate learning rates are temporarily doubled (`*= 2.0`) to jolt the expert out of collapse.
+4. **Gate Floor:** The Graph expert's gate weight is hard-clamped to a minimum of `0.15` (15%).
+
+---
+
+## 5. Multi-Objective Loss Function
+
+* **Alternative:** Pure MSE. Failed because it doesn't optimize candidate ordering.
+* **Chosen Loss:**
+  ```python
+  Loss = (0.5 * MSE) + (0.5 * MarginRankingLoss) + (0.1 * AuxGraphLoss)
+  ```
+  * **Margin Ranking Loss:** If a "Good Fit" and "No Fit" are in the same batch, the model is penalized unless the Good Fit scores at least `0.20` higher. (Directly optimizes nDCG/Spearman).
+  * **Auxiliary Graph Loss:** A BCE loss applied directly to the Graph expert's raw output. This ensures the MoE joint-loss doesn't "overwrite" the Graph expert's pretraining.
+
+---
+
+## 6. Collapse Diagnostics & Plots
+
+After training, expert outputs and gate weights were plotted across the test set.
+
+![Expert Score Distributions](../plots/expert_score_distribution_moev2.png)
+
+### Observation 1: Expert Health
+* **Text Expert Mean:** 0.571 (Std: 0.202)
+* **Graph Expert Mean:** 0.090 (Std: 0.062)
+* *Analysis:* The left subplot shows overlapping histograms. The Text expert (blue) spans a wide range. Crucially, the Graph expert (coral) is NOT a spike at zero. A standard deviation `> 0.05` confirms the expert is healthy and discriminating.
+
+### Observation 2: Gate Weight Allocation
+* **Mean Text Gate:** 69.2%
+* **Mean Graph Gate:** 30.8%
+* *Analysis:* The middle subplot shows the gate dynamically blending the experts. The graph expert is contributing significantly (~31%), proving that the 0.15 gate floor and pretraining successfully prevented suppression.
+
+### Observation 3: Skill Count vs. Graph Gate Weight
+* *Analysis:* The right subplot maps Normalised Skill Count (x-axis) against the Graph Gate Weight (y-axis). A positive correlation is visible. The model successfully learned the logic: **More extracted skills = stronger graph evidence = higher graph gate weight.**
+
+---
+
+## 7. Gating Distribution Analysis & Observations
+A critical part of our evaluation was verifying that the Gating Network was actually "mixing" the experts rather than just picking one and shutting down the other.
+### Observation A: Identifying Gate Collapse (The "Over-Trust" Problem) (from moev1)
+In our early iterations (and characteristic of v1), we observed the distribution shown below:
+![](../plots/gate_weight_distribution.png)
+
+#### What this shows: The gate is assigning a weight of 0.97 to 0.99 to the Graph Expert for almost every single resume.
+The Problem: This is a "Hidden Collapse." Even though the scores might look okay, the model has stopped being a Mixture of Experts. It has decided the Text Expert is useless and is effectively only using the Graph Expert. This prevents the model from using semantic "vibe" cues, leading to poor generalization on resumes with few skills.
+### Observation B: Successful Balanced Gating (MoE v2)
+After introducing the Normalised Skill Count as a gate input and the 0.15 Gate Floor, we achieved the distribution below:
+![](../plots/gate_weight_distributions_moev2.png)
+
+#### What this shows:
+Text Gate (Blue): Centers around 0.6 - 0.7.
+Graph Gate (Orange): Centers around 0.3 - 0.4.
+The Success: The gate is now actively balancing both perspectives. It treats the Text Expert as the "foundation" (higher base weight) but adjusts the Graph Expert's contribution dynamically.
+Result: This balance is exactly what allows for Interpretable Recourse. Because both experts have significant "say" in the final score, we can now tell a candidate: "Your semantic background is strong (0.7), but you are missing specific technical keywords required by the Graph (0.3)."
+
+## 8. Full Results — Architecture Comparison
 
 | Model | MAE ↓ | Spearman ρ ↑ | nDCG@10 ↑ | RBO ↑ |
 |---|---|---|---|---|
@@ -271,31 +134,9 @@ Overlapping histograms of text expert scores (blue) and graph expert scores (cor
 | Late Fusion | 0.3793 | 0.0528 | 0.5607 | 0.4034 |
 | Cross-Attention | 0.3619 | 0.1961 | 0.6004 | 0.4070 |
 | MoE v1 | 0.3737 | 0.1070 | 0.6032 | 0.4162 |
-| **MoE v2** | **0.3410** | **0.3338** | **0.6883** | **0.4447** |
+| **MoE v2 (Interpretable)** | **0.3497** | **0.3097** | **0.6946** | **0.4216** |
 
-> **Insert bar chart: nDCG@10 across all 6 models** (showing the step-change at MoE v2)
+### Final Conclusion
+MoE v2 achieves the best performance across all metrics. The most striking improvement is in the **Spearman correlation (0.107 → 0.309)** and **nDCG@10 (0.603 → 0.694)**. By moving to a Margin Ranking Loss and a mathematically sound Graph Expert, the model finally understands how to rank candidates sequentially. 
 
-MoE v2 is the best model on every metric. The Spearman correlation improvement is the most striking: 0.107 (v1) → 0.334 (v2), a 3× improvement in the model's ability to rank candidates in the correct order. nDCG@10 improves from 0.603 to 0.688, and RBO from 0.416 to 0.445.
-
----
-
-## Summary of Design Decisions
-
-| Decision | What Was Tried First | Why It Failed | What Replaced It |
-|---|---|---|---|
-| Text encoder | Cross-encoder (ms-marco-MiniLM) used as bi-encoder | Cross-encoders require joint input; separate encoding produces incorrect representations | `all-MiniLM-L6-v2` — purpose-built bi-encoder |
-| Graph scoring | Mean-pool GNN embeddings → cosine | Dense GNN space makes all pairs produce cosine ~1.0 | Neighbourhood contextualisation + JD-queries-resume cross-attention |
-| Graph pretraining target | Binary BCE on Jaccard > 0.1 | 99.5% negative class; classifier learns to always predict "no overlap" | MSE regression on normalised Jaccard (max=0.30) |
-| Pretraining sampling | Uniform batches | Dominated by near-zero Jaccard pairs; expert converges to constant | `WeightedRandomSampler` with `sqrt(Jaccard) + 0.02` weights |
-| Gate inputs | Text score, graph score | Blind to how much graph evidence is available; can't route correctly for skill-sparse resumes | Added normalised skill count as third gate input |
-| Collapse prevention | None (v1) | Graph expert fully suppressed from epoch 1 of joint training | Gate floor 0.15 + differential LRs + live collapse monitoring guard |
-| Loss function | MSE only | Optimises score accuracy, not ranking order | MSE + margin ranking loss (margin=0.20) + aux graph MSE (β=0.1) |
-
----
-
-## Output
-
-| File | Contents | Used By |
-|---|---|---|
-| `best_moe_v2.pth` | Trained MoE v2 model weights | Notebook 5 (Recourse Generation) |
-| `architecture_comparison.csv` | All 6 model results across all metrics | Reporting / analysis |
+The saved `best_moe_v2.pth` is now ready for **Notebook 5**, where we will exploit this disentangled architecture to generate human-readable recourse.
