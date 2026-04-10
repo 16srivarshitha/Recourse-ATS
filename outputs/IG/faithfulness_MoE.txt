@@ -1,0 +1,5 @@
+Model: MoE
+Original score          : 0.3453
+Score after masking top-5: 0.3453
+Score drop              : -0.0000
+Faithful                : False

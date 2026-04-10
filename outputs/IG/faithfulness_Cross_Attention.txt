@@ -1,0 +1,5 @@
+Model: Cross-Attention
+Original score          : 0.2498
+Score after masking top-5: 0.2639
+Score drop              : -0.0141
+Faithful                : False
